@@ -404,9 +404,11 @@ function loadStore(){
     lastRead: {book:'isaiah', chapter:1},
     streak: {count:0,last:null},
     visitedChapters: {},
+    aiDrafts: {person:{}, theme:{}, symbol:{}},
   };
 }
 let store = loadStore();
+store.aiDrafts = store.aiDrafts || {person:{}, theme:{}, symbol:{}}; // defensive default for stores saved before this feature existed
 function saveStore(){
   try{ localStorage.setItem(LS_KEY, JSON.stringify(store)); }catch(e){}
 }
@@ -1413,9 +1415,67 @@ function renderTimeline(el){
 /* ---------------------------------------------------------------
    PEOPLE
    --------------------------------------------------------------- */
+/* ---------------------------------------------------------------
+   AI-DRAFTED EXPLORE CONTENT (People/Themes/Symbols) — same
+   unverified/draft trust model as AI Insight, extended to whole
+   profiles instead of single verses. Drafts never enter DATA;
+   they live only in this browser's localStorage.
+   --------------------------------------------------------------- */
+function slugifyQuery(q){ return q.trim().toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,''); }
+function askAiBoxHtml(type, placeholder){
+  return `<div class="card" style="margin-top:18px;border-style:dashed;">
+    <div class="eyebrow" style="margin-bottom:8px;">Ask AI about a ${type} not listed here <span style="font-weight:400;text-transform:none;color:var(--ink-faint);">— unverified draft, saved only in your browser</span></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+      <input id="askAiInput" placeholder="${esc(placeholder)}" style="flex:1;min-width:180px;border:1px solid var(--border);border-radius:8px;padding:9px 12px;background:var(--surface-2);color:var(--ink);font-family:var(--sans);">
+      <button class="btn small" id="askAiBtn">Generate</button>
+    </div>
+    <div id="askAiStatus" style="margin-top:8px;font-size:.82rem;"></div>
+  </div>`;
+}
+function bindAskAiBox(el, type, onSuccess){
+  const btn = el.querySelector('#askAiBtn'); const input = el.querySelector('#askAiInput'); const status = el.querySelector('#askAiStatus');
+  if(!btn) return;
+  const onClaudeHost = /claude\.(ai|site)|anthropic/i.test(window.location.hostname) || window.location.hostname==='';
+  btn.addEventListener('click', async ()=>{
+    const q = input.value.trim(); if(!q) return;
+    if(onClaudeHost){
+      status.innerHTML = `<span style="color:var(--christ);">This calls a serverless function that only works once deployed to your own site with an Anthropic API key — it won't run on this preview link.</span>`;
+      return;
+    }
+    btn.disabled = true;
+    status.innerHTML = `<div class="ai-loading" style="padding:2px 0;"><div class="ai-spin"></div>Generating a draft ${esc(type)}…</div>`;
+    try{
+      const resp = await fetch('/.netlify/functions/ai-explore', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({type, query:q}),
+      });
+      const data = await resp.json().catch(()=>({error:'Unreadable response.'}));
+      if(!resp.ok || data.error) throw new Error(data.error || `Request failed (${resp.status})`);
+      const id = 'ai::'+type+'::'+slugifyQuery(q);
+      store.aiDrafts[type] = store.aiDrafts[type]||{};
+      store.aiDrafts[type][id] = {data:data.result, query:q, date:Date.now()};
+      saveStore();
+      input.value='';
+      onSuccess(id);
+    }catch(err){
+      status.innerHTML = `<span style="color:var(--christ);">${esc(err.message)}</span>`;
+    }
+    btn.disabled = false;
+  });
+}
+function draftCardHtml(id, draft, navTarget){
+  return `<div class="list-card" data-open-draft="${id}" data-nav-target="${navTarget}" style="cursor:pointer;border-style:dashed;">
+    <span class="ai-badge">AI Draft · Unverified</span>
+    <h3 style="margin-top:2px;">${esc(draft.data.name||draft.query)}</h3>
+  </div>`;
+}
+
 function renderPeopleList(el){
-  el.innerHTML = `<div class="page-title">People</div><div class="page-sub">Key figures in this week's reading.</div>
-    <div class="grid-2" id="peopleGrid"></div>`;
+  const drafts = store.aiDrafts.person||{};
+  el.innerHTML = `<div class="page-title">People</div><div class="page-sub">Key figures in this week's reading, plus major figures across the Old Testament.</div>
+    <div class="grid-2" id="peopleGrid"></div>
+    ${Object.keys(drafts).length?`<h3 style="margin:22px 0 10px;">AI-Generated Drafts</h3><div class="grid-2" id="peopleDrafts"></div>`:''}
+    ${askAiBoxHtml('person', 'e.g. Rebekah, Gideon, Cyrus')}`;
   const grid = el.querySelector('#peopleGrid');
   grid.innerHTML = Object.entries(DATA.people).map(([id,p])=>`
     <div class="list-card" data-open-person="${id}" style="cursor:pointer;display:flex;gap:14px;align-items:center;">
@@ -1423,27 +1483,37 @@ function renderPeopleList(el){
       <div><h3>${esc(p.name)}</h3><div style="font-size:.85rem;color:var(--ink-dim);">${esc(p.who.slice(0,90))}…</div></div>
     </div>`).join('');
   grid.querySelectorAll('[data-open-person]').forEach(n=>n.addEventListener('click', ()=>navigate('peopleDetail',{detailId:n.getAttribute('data-open-person')})));
+  const draftsGrid = el.querySelector('#peopleDrafts');
+  if(draftsGrid){
+    draftsGrid.innerHTML = Object.entries(drafts).map(([id,d])=>draftCardHtml(id,d,'peopleDetail')).join('');
+    draftsGrid.querySelectorAll('[data-open-draft]').forEach(n=>n.addEventListener('click', ()=>navigate(n.getAttribute('data-nav-target'),{detailId:n.getAttribute('data-open-draft')})));
+  }
+  bindAskAiBox(el, 'person', (id)=>navigate('peopleDetail',{detailId:id}));
 }
 function renderPersonDetail(el){
-  const p = DATA.people[S.detailId]; if(!p){ renderPeopleList(el); return; }
+  const isDraft = S.detailId && S.detailId.startsWith('ai::person::');
+  const p = isDraft ? (store.aiDrafts.person[S.detailId]||{}).data : DATA.people[S.detailId];
+  if(!p){ renderPeopleList(el); return; }
+  const arr = (x)=>Array.isArray(x)?x:[];
   el.innerHTML = `
     <button class="btn ghost small" data-nav="people" style="margin-bottom:16px;">${icon('chevL')} All People</button>
-    <div class="profile-header"><div class="avatar-circ" style="width:64px;height:64px;font-size:1.7rem;">${esc(p.name[0])}</div>
+    ${isDraft?`<div class="ai-warning">⚠️ <strong>AI-generated draft — unverified.</strong> Not reviewed against Church sources. Saved only in your browser.</div>`:''}
+    <div class="profile-header"><div class="avatar-circ" style="width:64px;height:64px;font-size:1.7rem;">${esc((p.name||'?')[0])}</div>
       <div><div class="page-title" style="margin-bottom:2px;">${esc(p.name)}</div><div style="color:var(--ink-dim);font-size:.92rem;">${esc(p.who)}</div></div></div>
     <div class="grid-2">
       <div>
-        <div class="profile-section"><h4>Timeline</h4>${p.timeline.map(t=>`<div class="parallel-step">${esc(t)}</div>`).join('')}</div>
-        <div class="profile-section"><h4>Major Events</h4>${p.events.map(t=>`<div class="parallel-step">${esc(t)}</div>`).join('')}</div>
-        <div class="profile-section"><h4>Scriptures</h4>${p.scriptures.map(t=>`<span class="tag-pill">${esc(t)}</span>`).join('')}</div>
+        <div class="profile-section"><h4>Timeline</h4>${arr(p.timeline).map(t=>`<div class="parallel-step">${esc(t)}</div>`).join('')}</div>
+        <div class="profile-section"><h4>Major Events</h4>${arr(p.events).map(t=>`<div class="parallel-step">${esc(t)}</div>`).join('')}</div>
+        <div class="profile-section"><h4>Scriptures</h4>${arr(p.scriptures).map(t=>`<span class="tag-pill">${esc(t)}</span>`).join('')}</div>
       </div>
       <div>
-        <div class="profile-section"><h4>Strengths</h4><ul style="margin:0;padding-left:18px;font-size:.88rem;">${p.strengths.map(t=>`<li>${esc(t)}</li>`).join('')}</ul></div>
-        <div class="profile-section"><h4>Challenges</h4><ul style="margin:0;padding-left:18px;font-size:.88rem;">${p.challenges.map(t=>`<li>${esc(t)}</li>`).join('')}</ul></div>
-        <div class="profile-section"><h4>Encounters with Christ</h4><ul style="margin:0;padding-left:18px;font-size:.88rem;">${p.christEncounters.map(t=>`<li>${esc(t)}</li>`).join('')}</ul></div>
+        <div class="profile-section"><h4>Strengths</h4><ul style="margin:0;padding-left:18px;font-size:.88rem;">${arr(p.strengths).map(t=>`<li>${esc(t)}</li>`).join('')}</ul></div>
+        <div class="profile-section"><h4>Challenges</h4><ul style="margin:0;padding-left:18px;font-size:.88rem;">${arr(p.challenges).map(t=>`<li>${esc(t)}</li>`).join('')}</ul></div>
+        <div class="profile-section"><h4>Encounters with Christ</h4><ul style="margin:0;padding-left:18px;font-size:.88rem;">${arr(p.christEncounters).map(t=>`<li>${esc(t)}</li>`).join('')}</ul></div>
       </div>
     </div>
     <div class="profile-section"><h4>Why They Matter</h4><p style="font-size:.92rem;">${esc(p.whyMatters)}</p></div>
-    <div class="profile-section"><h4>Related People</h4><div class="related-people">${p.related.map(r=>`<button class="pill" data-open-person="${r}">${esc(DATA.people[r].name)}</button>`).join('')}</div></div>`;
+    ${!isDraft?`<div class="profile-section"><h4>Related People</h4><div class="related-people">${arr(p.related).map(r=>`<button class="pill" data-open-person="${r}">${esc(DATA.people[r].name)}</button>`).join('')}</div></div>`:''}`;
   el.querySelectorAll('[data-open-person]').forEach(n=>n.addEventListener('click', ()=>navigate('peopleDetail',{detailId:n.getAttribute('data-open-person')})));
 }
 
@@ -1451,8 +1521,11 @@ function renderPersonDetail(el){
    THEMES
    --------------------------------------------------------------- */
 function renderThemesList(el){
+  const drafts = store.aiDrafts.theme||{};
   el.innerHTML = `<div class="page-title">Theme Studies</div><div class="page-sub">Follow an idea across scripture.</div>
-    <div class="grid-3" id="themeGrid"></div>`;
+    <div class="grid-3" id="themeGrid"></div>
+    ${Object.keys(drafts).length?`<h3 style="margin:22px 0 10px;">AI-Generated Drafts</h3><div class="grid-3" id="themeDrafts"></div>`:''}
+    ${askAiBoxHtml('theme', 'e.g. Wilderness, Kingship, Sacrifice')}`;
   const grid = el.querySelector('#themeGrid');
   grid.innerHTML = Object.entries(DATA.themes).map(([id,t])=>`
     <div class="list-card" data-open-theme="${id}" style="cursor:pointer;">
@@ -1460,14 +1533,24 @@ function renderThemesList(el){
       <div style="font-size:.76rem;color:var(--ink-faint);margin-top:8px;">${t.entries.length} scriptures →</div>
     </div>`).join('');
   grid.querySelectorAll('[data-open-theme]').forEach(n=>n.addEventListener('click', ()=>navigate('themeDetail',{detailId:n.getAttribute('data-open-theme')})));
+  const draftsGrid = el.querySelector('#themeDrafts');
+  if(draftsGrid){
+    draftsGrid.innerHTML = Object.entries(drafts).map(([id,d])=>draftCardHtml(id,d,'themeDetail')).join('');
+    draftsGrid.querySelectorAll('[data-open-draft]').forEach(n=>n.addEventListener('click', ()=>navigate(n.getAttribute('data-nav-target'),{detailId:n.getAttribute('data-open-draft')})));
+  }
+  bindAskAiBox(el, 'theme', (id)=>navigate('themeDetail',{detailId:id}));
 }
 function renderThemeDetail(el){
-  const t = DATA.themes[S.detailId]; if(!t){ renderThemesList(el); return; }
+  const isDraft = S.detailId && S.detailId.startsWith('ai::theme::');
+  const t = isDraft ? (store.aiDrafts.theme[S.detailId]||{}).data : DATA.themes[S.detailId];
+  if(!t){ renderThemesList(el); return; }
+  const entries = Array.isArray(t.entries) ? t.entries : [];
   el.innerHTML = `
     <button class="btn ghost small" data-nav="themes" style="margin-bottom:16px;">${icon('chevL')} All Themes</button>
+    ${isDraft?`<div class="ai-warning">⚠️ <strong>AI-generated draft — unverified.</strong> Not reviewed against Church sources. Saved only in your browser.</div>`:''}
     <div class="page-title">${esc(t.name)}</div><div class="page-sub">${esc(t.intro)}</div>
     <div class="findchrist-trail">
-      ${t.entries.map(e=>`<div class="fc-item"><div class="fc-marker" style="background:var(--gold-soft);color:var(--accent-ink);">◆</div>
+      ${entries.map(e=>`<div class="fc-item"><div class="fc-marker" style="background:var(--gold-soft);color:var(--accent-ink);">◆</div>
         <div><div class="fc-ref">${esc(e.ref)}</div><div class="fc-note">${esc(e.note)}</div></div></div>`).join('')}
     </div>
     <div class="synthesis-box" style="margin-top:16px;"><span class="eyebrow">Synthesis</span>${esc(t.synthesis)}</div>`;
@@ -1477,26 +1560,41 @@ function renderThemeDetail(el){
    SYMBOLS
    --------------------------------------------------------------- */
 function renderSymbolsList(el){
+  const drafts = store.aiDrafts.symbol||{};
   el.innerHTML = `<div class="page-title">Symbol Explorer</div><div class="page-sub">A searchable biblical symbolism reference.</div>
-    <div class="symbol-grid" id="symGrid"></div>`;
+    <div class="symbol-grid" id="symGrid"></div>
+    ${Object.keys(drafts).length?`<h3 style="margin:22px 0 10px;">AI-Generated Drafts</h3><div class="symbol-grid" id="symDrafts"></div>`:''}
+    ${askAiBoxHtml('symbol', 'e.g. Salt, Cloud, Crown')}`;
   const grid = el.querySelector('#symGrid');
   grid.innerHTML = Object.entries(DATA.symbols).map(([id,s])=>`
     <div class="symbol-tile" data-open-symbol="${id}" style="cursor:pointer;">
       <div style="font-size:1.6rem;">${symbolEmoji(id)}</div><div class="sym-name">${esc(s.name)}</div>
     </div>`).join('');
   grid.querySelectorAll('[data-open-symbol]').forEach(n=>n.addEventListener('click', ()=>navigate('symbolDetail',{detailId:n.getAttribute('data-open-symbol')})));
+  const draftsGrid = el.querySelector('#symDrafts');
+  if(draftsGrid){
+    draftsGrid.innerHTML = Object.entries(drafts).map(([id,d])=>`
+      <div class="symbol-tile" data-open-draft="${id}" data-nav-target="symbolDetail" style="cursor:pointer;border-style:dashed;">
+        <span class="ai-badge">AI</span><div class="sym-name">${esc(d.data.name||d.query)}</div>
+      </div>`).join('');
+    draftsGrid.querySelectorAll('[data-open-draft]').forEach(n=>n.addEventListener('click', ()=>navigate(n.getAttribute('data-nav-target'),{detailId:n.getAttribute('data-open-draft')})));
+  }
+  bindAskAiBox(el, 'symbol', (id)=>navigate('symbolDetail',{detailId:id}));
 }
 function symbolEmoji(id){ return {light:'✨',water:'💧',vineyard:'🍇',mountain:'⛰️',branch:'🌿',fire:'🔥',shepherd:'🐑',bread:'🍞',rock:'🪨',lamb:'🐑'}[id]||'◆'; }
 function renderSymbolDetail(el){
-  const s = DATA.symbols[S.detailId]; if(!s){ renderSymbolsList(el); return; }
+  const isDraft = S.detailId && S.detailId.startsWith('ai::symbol::');
+  const s = isDraft ? (store.aiDrafts.symbol[S.detailId]||{}).data : DATA.symbols[S.detailId];
+  if(!s){ renderSymbolsList(el); return; }
   el.innerHTML = `
     <button class="btn ghost small" data-nav="symbols" style="margin-bottom:16px;">${icon('chevL')} All Symbols</button>
-    <div class="page-title">${symbolEmoji(S.detailId)} ${esc(s.name)}</div>
+    ${isDraft?`<div class="ai-warning">⚠️ <strong>AI-generated draft — unverified.</strong> Not reviewed against Church sources. Saved only in your browser.</div>`:''}
+    <div class="page-title">${isDraft?'':symbolEmoji(S.detailId)} ${esc(s.name)}</div>
     <div class="card" style="margin-bottom:16px;"><p style="margin:0;">${esc(s.meaning)}</p></div>
     <div class="grid-2">
       <div class="list-card"><h3>Old Testament</h3><p style="font-size:.87rem;">${esc(s.ot)}</p></div>
-      <div class="list-card"><h3>New Testament</h3><p style="font-size:.87rem;">${esc(s.nt)}</p></div>
-      <div class="list-card"><h3>Book of Mormon</h3><p style="font-size:.87rem;">${esc(s.bom)}</p></div>
+      ${s.nt?`<div class="list-card"><h3>New Testament</h3><p style="font-size:.87rem;">${esc(s.nt)}</p></div>`:''}
+      ${s.bom?`<div class="list-card"><h3>Book of Mormon</h3><p style="font-size:.87rem;">${esc(s.bom)}</p></div>`:''}
       ${s.temple?`<div class="list-card"><h3>Temple / Covenant</h3><p style="font-size:.87rem;">${esc(s.temple)}</p></div>`:''}
     </div>
     ${s.christ?`<div class="synthesis-box" style="margin-top:16px;"><span class="eyebrow">Christ Connection</span>${esc(s.christ)}</div>`:''}
